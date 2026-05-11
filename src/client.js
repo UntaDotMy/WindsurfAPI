@@ -36,6 +36,19 @@ export function isCascadeTransportError(err) {
   return /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed|panel state/i.test(msg);
 }
 
+export function modifiedTextTopUpDelta(responseText = '', modifiedText = '', cursor = 0) {
+  if (!modifiedText || modifiedText.length <= cursor) return '';
+  if (!modifiedText.startsWith(responseText || '')) return '';
+  const delta = modifiedText.slice(cursor);
+  const compactDelta = delta.replace(/\s+/g, ' ').trim();
+  if (!compactDelta) return '';
+  const compactEmitted = (responseText || modifiedText.slice(0, cursor)).replace(/\s+/g, ' ').trim();
+  // Some LS builds report modified_response as response+response during the
+  // final sweep. Treat that as a duplicate, not as a polished extension.
+  if (compactDelta.length >= 12 && compactEmitted.endsWith(compactDelta)) return '';
+  return delta;
+}
+
 function markCascadeTransportError(err) {
   if (!err || typeof err !== 'object') return err;
   err.isModelError = true;
@@ -1077,8 +1090,8 @@ export class WindsurfClient {
               // wrong content onto the stream, so we skip it and keep the
               // raw responseText we already showed.
               const cursor = yieldedByStep.get(i) || 0;
-              if (modifiedText.length > cursor && modifiedText.startsWith(responseText)) {
-                const delta = modifiedText.slice(cursor);
+              const delta = modifiedTextTopUpDelta(responseText, modifiedText, cursor);
+              if (delta) {
                 yieldedByStep.set(i, modifiedText.length);
                 totalYielded += delta.length;
                 chunks.push({ text: delta, thinking: '', isError: false });
