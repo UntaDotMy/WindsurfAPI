@@ -3174,63 +3174,83 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                     const intendedTool = detectToolIntentInNarrative(accNarrative, declaredTools, { lastUserText: lastUser });
                     if (intendedTool) {
                       try {
-                        const correctionMessages = [
-                          ...cascadeMessages,
-                          { role: 'assistant', content: accNarrative.slice(0, 4000) },
-                          { role: 'user', content:
-                            `Your previous response described intending to call \`${intendedTool}\` but didn't emit the tool-call protocol block. ` +
-                            `Re-emit the call now using the EXACT protocol format defined at the top of this conversation. ` +
-                            `Do NOT narrate. Do NOT describe. Just the protocol block. ` +
-                            `Provide a concrete argument value (the literal command / file path / query) — never placeholders like "command" or "the file".` },
-                        ];
-                        log.info(`Chat[stream]: NLU retry — first pass narrate-only, retrying with correction (tool=${intendedTool} markers=${markers.join(',') || 'none'})`);
-                        const retryChunks = await client.cascadeChat(correctionMessages, modelEnum, modelUid, {
-                          reuseEntry: null,
-                          toolPreamble: nativeBridgeOn ? '' : toolPreamble,
-                          displayModel: model,
-                          nativeMode: nativeBridgeOn,
-                          nativeAllowlist: nativeOpts?.allowlist || null,
-                          additionalSteps: nativeOpts?.additionalSteps || null,
+                        const firstPassSynth = synthesizeToolCallFromIntent(intendedTool, declaredTools, {
+                          lastUserText: lastUser,
+                          sourceText: accNarrative,
                         });
-                        let retryText = '';
-                        let retryThinking = '';
-                        for (const c of retryChunks) {
-                          if (c.text) retryText += c.text;
-                          if (c.thinking) retryThinking += c.thinking;
-                        }
-                        const retryParsed = parseToolCallsFromText(retryText, { modelKey, provider, route: deps.route || 'chat' });
-                        let retryCalls = filterToolCallsByAllowlist(retryParsed.toolCalls || [], declaredTools);
-                        const retrySource = retryText.trim() ? retryText : retryThinking;
-                        if (!retryCalls.length) {
-                          const recovered2 = extractIntentFromNarrative(retrySource, declaredTools, { lastUserText: lastUser });
-                          if (recovered2.length) {
-                            retryCalls = filterToolCallsByAllowlist(
-                              recovered2.map((r, i) => ({ id: `nlu_retry_${i}_${Date.now().toString(36)}`, name: r.name, argumentsJson: r.argumentsJson })),
-                              declaredTools,
-                            );
+                        if (firstPassSynth) {
+                          const synthesizedCalls = filterToolCallsByAllowlist([
+                            { id: `nlu_synth_0_${Date.now().toString(36)}`, name: firstPassSynth.name, argumentsJson: firstPassSynth.argumentsJson },
+                          ], declaredTools);
+                          for (const rawTc of synthesizedCalls) {
+                            const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
+                            const idx = collectedToolCalls.length;
+                            collectedToolCalls.push(tc);
+                            emitToolCallDelta(tc, idx);
+                          }
+                          if (synthesizedCalls.length) {
+                            log.info(`Chat[stream]: NLU synth — promoted safe first-pass tool_call without retry (tool=${intendedTool})`);
                           }
                         }
-                        if (!retryCalls.length) {
-                          const synthesized = synthesizeToolCallFromIntent(intendedTool, declaredTools, {
-                            lastUserText: lastUser,
-                            sourceText: retrySource || accNarrative,
+                        if (collectedToolCalls.length === 0) {
+                          const correctionMessages = [
+                            ...cascadeMessages,
+                            { role: 'assistant', content: accNarrative.slice(0, 4000) },
+                            { role: 'user', content:
+                              `Your previous response described intending to call \`${intendedTool}\` but didn't emit the tool-call protocol block. ` +
+                              `Re-emit the call now using the EXACT protocol format defined at the top of this conversation. ` +
+                              `Do NOT narrate. Do NOT describe. Just the protocol block. ` +
+                              `Provide a concrete argument value (the literal command / file path / query) — never placeholders like "command" or "the file".` },
+                          ];
+                          log.info(`Chat[stream]: NLU retry — first pass narrate-only, retrying with correction (tool=${intendedTool} markers=${markers.join(',') || 'none'})`);
+                          const retryChunks = await client.cascadeChat(correctionMessages, modelEnum, modelUid, {
+                            reuseEntry: null,
+                            toolPreamble: nativeBridgeOn ? '' : toolPreamble,
+                            displayModel: model,
+                            nativeMode: nativeBridgeOn,
+                            nativeAllowlist: nativeOpts?.allowlist || null,
+                            additionalSteps: nativeOpts?.additionalSteps || null,
                           });
-                          if (synthesized) {
-                            retryCalls = filterToolCallsByAllowlist([
-                              { id: `nlu_synth_0_${Date.now().toString(36)}`, name: synthesized.name, argumentsJson: synthesized.argumentsJson },
-                            ], declaredTools);
+                          let retryText = '';
+                          let retryThinking = '';
+                          for (const c of retryChunks) {
+                            if (c.text) retryText += c.text;
+                            if (c.thinking) retryThinking += c.thinking;
                           }
-                        }
-                        for (const rawTc of retryCalls) {
-                          const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
-                          const idx = collectedToolCalls.length;
-                          collectedToolCalls.push(tc);
-                          emitToolCallDelta(tc, idx);
-                        }
-                        if (retryCalls.length) {
-                          log.info(`Chat[stream]: NLU retry — promoted ${retryCalls.length} tool_call(s) on second pass (tool=${intendedTool})`);
-                        } else {
-                          log.warn(`Chat[stream]: NLU retry — second pass also produced 0 tool_calls; giving up (model=${modelKey})`);
+                          const retryParsed = parseToolCallsFromText(retryText, { modelKey, provider, route: deps.route || 'chat' });
+                          let retryCalls = filterToolCallsByAllowlist(retryParsed.toolCalls || [], declaredTools);
+                          const retrySource = retryText.trim() ? retryText : retryThinking;
+                          if (!retryCalls.length) {
+                            const recovered2 = extractIntentFromNarrative(retrySource, declaredTools, { lastUserText: lastUser });
+                            if (recovered2.length) {
+                              retryCalls = filterToolCallsByAllowlist(
+                                recovered2.map((r, i) => ({ id: `nlu_retry_${i}_${Date.now().toString(36)}`, name: r.name, argumentsJson: r.argumentsJson })),
+                                declaredTools,
+                              );
+                            }
+                          }
+                          if (!retryCalls.length) {
+                            const synthesized = synthesizeToolCallFromIntent(intendedTool, declaredTools, {
+                              lastUserText: lastUser,
+                              sourceText: retrySource || accNarrative,
+                            });
+                            if (synthesized) {
+                              retryCalls = filterToolCallsByAllowlist([
+                                { id: `nlu_synth_0_${Date.now().toString(36)}`, name: synthesized.name, argumentsJson: synthesized.argumentsJson },
+                              ], declaredTools);
+                            }
+                          }
+                          for (const rawTc of retryCalls) {
+                            const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
+                            const idx = collectedToolCalls.length;
+                            collectedToolCalls.push(tc);
+                            emitToolCallDelta(tc, idx);
+                          }
+                          if (retryCalls.length) {
+                            log.info(`Chat[stream]: NLU retry — promoted ${retryCalls.length} tool_call(s) on second pass (tool=${intendedTool})`);
+                          } else {
+                            log.warn(`Chat[stream]: NLU retry — second pass also produced 0 tool_calls; giving up (model=${modelKey})`);
+                          }
                         }
                       } catch (retryErr) {
                         log.warn(`Chat[stream]: NLU retry failed: ${retryErr.message}`);

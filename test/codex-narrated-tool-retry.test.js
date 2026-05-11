@@ -43,4 +43,16 @@ describe('Codex narrated tool retry', () => {
     assert.match(region, /synthesizeToolCallFromIntent\(intendedTool, declaredTools/,
       'stream retry must synthesize a safe inventory call if the correction pass still narrates');
   });
+
+  test('stream path synthesizes safe inventory before spending a retry request', () => {
+    const start = CHAT_JS.indexOf('const firstPassSynth = synthesizeToolCallFromIntent(intendedTool, declaredTools');
+    const retry = CHAT_JS.indexOf('await client.cascadeChat(correctionMessages', start);
+    assert.ok(start > -1, 'stream path must attempt first-pass synthesis');
+    assert.ok(retry > start, 'first-pass synthesis must happen before the correction cascade retry');
+    const region = CHAT_JS.slice(start, retry);
+    assert.match(region, /NLU synth — promoted safe first-pass tool_call without retry/,
+      'successful synthesis should skip the extra model round-trip');
+    assert.match(region, /if \(collectedToolCalls\.length === 0\) \{/,
+      'correction retry should only run if synthesis did not emit a tool call');
+  });
 });
