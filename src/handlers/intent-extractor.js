@@ -325,10 +325,10 @@ function pickFallbackToolName(text, lastUserText, names, primaryParam) {
  *
  * Returns one of:
  *   - the matched declared tool name (when the model named it inline)
- *   - the FIRST declared tool name (when the narrative shows clear
- *     action intent + user actionable prompt + an action verb,
- *     even if the model didn't name a specific tool — GLM-5.1 will
- *     say "Let me list the files" without saying "Bash")
+ *   - a best-effort declared tool name (when the narrative shows clear
+ *     action intent + user actionable prompt + an action verb, even if the
+ *     model didn't name a specific tool — GLM-5.1 will say "Let me list
+ *     the files" without saying "Bash")
  *   - null when there's no usable signal
  *
  * v2.0.82 (#125 — proper translator layer beyond NLU).
@@ -352,9 +352,8 @@ export function detectToolIntentInNarrative(text, tools, opts = {}) {
     if (fnRe.test(text)) return fn;
   }
   // Pass 2: action keyword present (model said "let me list..." but
-  // didn't name the tool). Return the first declared tool — caller's
-  // correction prompt will name it explicitly so the retry knows
-  // which tool to emit.
+  // didn't name the tool). Prefer the declared tool whose name/primary
+  // argument matches the action, falling back to declaration order.
   if (actionVerbPattern.test(text)) return pickFallbackToolName(text, lastUserText, names, primaryParam);
   return null;
 }
