@@ -10,7 +10,7 @@ import { resolveModel, getModelInfo, pickRateLimitFallback } from '../models.js'
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
 import { recordRequest, recordTokenUsage, recordPolicyBlocked, recordRateLimited } from '../dashboard/stats.js';
-import { extractIntentFromNarrative, detectToolIntentInNarrative } from './intent-extractor.js';
+import { extractIntentFromNarrative, detectToolIntentInNarrative, synthesizeToolCallFromIntent } from './intent-extractor.js';
 import { markRequest as markQuietWindowRequest } from '../dashboard/quiet-window-updater.js';
 import { isModelAllowed } from '../dashboard/model-access.js';
 import { cacheKey, cacheGet, cacheSet } from '../cache.js';
@@ -2349,14 +2349,25 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
                 }
                 const retryParsed = parseToolCallsFromText(retryText, { modelKey, provider, route });
                 let retryCalls = filterToolCallsByAllowlist(retryParsed.toolCalls || [], tools);
+                const retrySource = retryText.trim() ? retryText : retryThinking;
                 if (!retryCalls.length) {
-                  const retrySource = retryText.trim() ? retryText : retryThinking;
                   const recovered2 = extractIntentFromNarrative(retrySource, tools, { lastUserText: lastUser });
                   if (recovered2.length) {
                     retryCalls = filterToolCallsByAllowlist(
                       recovered2.map((r, i) => ({ id: `nlu_retry_${i}_${Date.now().toString(36)}`, name: r.name, argumentsJson: r.argumentsJson })),
                       tools,
                     );
+                  }
+                }
+                if (!retryCalls.length) {
+                  const synthesized = synthesizeToolCallFromIntent(intendedTool, tools, {
+                    lastUserText: lastUser,
+                    sourceText: retrySource || narrativeSource,
+                  });
+                  if (synthesized) {
+                    retryCalls = filterToolCallsByAllowlist([
+                      { id: `nlu_synth_0_${Date.now().toString(36)}`, name: synthesized.name, argumentsJson: synthesized.argumentsJson },
+                    ], tools);
                   }
                 }
                 if (retryCalls.length) {
@@ -2762,6 +2773,10 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       // Accumulate chunks so we can cache a successful response at the end.
       let accText = '';
       let accThinking = '';
+      const holdEmulatedToolNarrative = emulateTools
+        && declaredTools.length > 0
+        && isNluRetryEnabled(provider, modelKey, deps.route || 'chat')
+        && !wantJson;
 
       // Cascade conversation pool (stream path). Opus 4.7 tool-emulated
       // requests opt in even when the global experiment toggle is off, because
@@ -2818,13 +2833,14 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         // instead of streaming it out. We can't safely fence-strip in the
         // middle of a stream (fence might straddle a chunk, and we'd need
         // lookahead). On finish we'll emit one clean JSON payload.
-        if (wantJson) return;
+        if (wantJson || holdEmulatedToolNarrative) return;
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: { content: clean }, finish_reason: null }] });
       };
       const emitThinking = (clean) => {
         if (!clean) return;
         accThinking += clean;
+        if (holdEmulatedToolNarrative) return;
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: { reasoning_content: clean }, finish_reason: null }] });
       };
@@ -3184,14 +3200,25 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                         }
                         const retryParsed = parseToolCallsFromText(retryText, { modelKey, provider, route: deps.route || 'chat' });
                         let retryCalls = filterToolCallsByAllowlist(retryParsed.toolCalls || [], declaredTools);
+                        const retrySource = retryText.trim() ? retryText : retryThinking;
                         if (!retryCalls.length) {
-                          const retrySource = retryText.trim() ? retryText : retryThinking;
                           const recovered2 = extractIntentFromNarrative(retrySource, declaredTools, { lastUserText: lastUser });
                           if (recovered2.length) {
                             retryCalls = filterToolCallsByAllowlist(
                               recovered2.map((r, i) => ({ id: `nlu_retry_${i}_${Date.now().toString(36)}`, name: r.name, argumentsJson: r.argumentsJson })),
                               declaredTools,
                             );
+                          }
+                        }
+                        if (!retryCalls.length) {
+                          const synthesized = synthesizeToolCallFromIntent(intendedTool, declaredTools, {
+                            lastUserText: lastUser,
+                            sourceText: retrySource || accNarrative,
+                          });
+                          if (synthesized) {
+                            retryCalls = filterToolCallsByAllowlist([
+                              { id: `nlu_synth_0_${Date.now().toString(36)}`, name: synthesized.name, argumentsJson: synthesized.argumentsJson },
+                            ], declaredTools);
                           }
                         }
                         for (const rawTc of retryCalls) {
@@ -3272,6 +3299,11 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 log.info(`Chat[stream]: nativeBridge=true received cascade tool calls but none mapped to caller tools (kinds=${cascadeResult.toolCalls.filter(tc => tc.cascade_native).map(tc => tc.name).join(',')})`);
               }
             }
+            if (holdEmulatedToolNarrative && collectedToolCalls.length > 0 && (accText || accThinking)) {
+              log.info(`Chat[stream]: held ${accText.length}c text/${accThinking.length}c thinking narrative until tool decision; dropping because tool_calls were emitted`);
+              accText = '';
+              accThinking = '';
+            }
             // Pool check-in on success (cascade only)
             if (reuseEnabled && cascadeResult?.cascadeId && (accText || collectedToolCalls.length)) {
               const turnComplete = appendAssistantTurn(messages, accText, collectedToolCalls);
@@ -3299,6 +3331,16 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             if (!rolePrinted) {
               send({ id, object: 'chat.completion.chunk', created, model,
                 choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+            }
+            if (holdEmulatedToolNarrative && collectedToolCalls.length === 0) {
+              if (accThinking) {
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: { reasoning_content: accThinking }, finish_reason: null }] });
+              }
+              if (accText) {
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: { content: accText }, finish_reason: null }] });
+              }
             }
             // For response_format=json_* we buffered all content — flush one
             // clean JSON payload now. extractJsonPayload strips fences and

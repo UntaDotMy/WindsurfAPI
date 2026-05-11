@@ -316,6 +316,59 @@ function pickFallbackToolName(text, lastUserText, names, primaryParam) {
   return ordered[0];
 }
 
+function isShellLikeTool(name, param) {
+  return /(?:shell|bash|exec|command|terminal|run)/i.test(String(name || ''))
+    || /^(?:command|cmd|script)$/i.test(String(param || ''));
+}
+
+function cleanCandidateCommand(line) {
+  return String(line || '')
+    .trim()
+    .replace(/^[-*•]\s*/, '')
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .trim();
+}
+
+function extractSafeReadOnlyCommand(sourceText) {
+  const text = String(sourceText || '');
+  const candidates = [];
+  const fenceRe = /```(?:powershell|pwsh|bash|sh|cmd)?\s*([\s\S]{1,1200}?)```/gi;
+  let m;
+  while ((m = fenceRe.exec(text)) !== null) {
+    candidates.push(...m[1].split(/\r?\n/));
+  }
+  candidates.push(...text.split(/\r?\n/));
+  for (const raw of candidates) {
+    const line = cleanCandidateCommand(raw);
+    if (!line || line.length > 500) continue;
+    if (/^(?:Get-ChildItem|Get-Content|Select-String|pwd|ls|dir|find|grep|rg|cat|type)\b/i.test(line)) {
+      return line;
+    }
+  }
+  return '';
+}
+
+export function synthesizeToolCallFromIntent(intendedTool, tools, opts = {}) {
+  if (!intendedTool || !Array.isArray(tools) || !tools.length) return null;
+  const { names, primaryParam } = indexTools(tools);
+  if (!names.has(intendedTool)) return null;
+  const param = primaryParam.get(intendedTool) || 'input';
+  if (!isShellLikeTool(intendedTool, param)) return null;
+  const combined = `${opts.sourceText || ''}\n${opts.lastUserText || ''}`;
+  if (!/\b(?:repo|repository|codebase|project|workspace|files?|folders?|directories|inventory|inspect|explore|understand|list)\b/i.test(combined)) {
+    return null;
+  }
+  const command = extractSafeReadOnlyCommand(combined)
+    || 'pwd; ls';
+  if (looksLikePlaceholderValue(command)) return null;
+  return {
+    name: intendedTool,
+    argumentsJson: JSON.stringify({ [param]: command }),
+    layer: 'synthesized-intent',
+    confidence: 0.5,
+  };
+}
+
 /**
  * Detect whether the model's narrative looks like it INTENDED to call
  * a tool but never produced a usable extraction. Used to gate the

@@ -14,7 +14,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { isNluRetryEnabled } from '../src/handlers/chat.js';
-import { extractIntentFromNarrative, detectToolIntentInNarrative } from '../src/handlers/intent-extractor.js';
+import { extractIntentFromNarrative, detectToolIntentInNarrative, synthesizeToolCallFromIntent } from '../src/handlers/intent-extractor.js';
 import { buildToolPreambleForProto } from '../src/handlers/tool-emulation.js';
 
 const fnTool = (name, props = { command: 'string' }, required = ['command']) => ({
@@ -237,6 +237,29 @@ describe('isNluRetryEnabled — Codex/GPT narrate retry defaults', () => {
       if (previous == null) delete process.env.WINDSURFAPI_NLU_RETRY;
       else process.env.WINDSURFAPI_NLU_RETRY = previous;
     }
+  });
+});
+
+describe('synthesizeToolCallFromIntent — last-resort Codex inventory call', () => {
+  it('creates a safe shell inventory command when retry still only narrates', () => {
+    const tc = synthesizeToolCallFromIntent('shell_exec', [APPLY_PATCH, SHELL], {
+      lastUserText: 'understand my codebase very detail',
+      sourceText: "I’ll inspect the repository structure and key project files first.",
+    });
+    assert.equal(tc.name, 'shell_exec');
+    assert.deepEqual(JSON.parse(tc.argumentsJson), {
+      command: 'pwd; ls',
+    });
+  });
+
+  it('lifts an explicit safe command from retry narration without a tool name', () => {
+    const tc = synthesizeToolCallFromIntent('shell_exec', [SHELL], {
+      lastUserText: 'understand my codebase',
+      sourceText: 'A safe PowerShell inventory command would be:\nGet-ChildItem -Force | Select-Object Mode,Length,Name',
+    });
+    assert.deepEqual(JSON.parse(tc.argumentsJson), {
+      command: 'Get-ChildItem -Force | Select-Object Mode,Length,Name',
+    });
   });
 });
 
