@@ -33,6 +33,7 @@ const SHELL = fnTool('shell_exec');
 const BASH = fnTool('Bash');
 const READ = fnTool('Read', { file_path: 'string' }, ['file_path']);
 const APPLY_PATCH = fnTool('apply_patch', { patch: 'string' }, ['patch']);
+const EXEC = fnTool('exec', { input: 'string' }, ['input']);
 
 describe('Chinese verb recognition (Layer 3)', () => {
   it('catches "让我用 Bash 命令 \'ls\'" with concrete value', () => {
@@ -242,13 +243,13 @@ describe('isNluRetryEnabled — Codex/GPT narrate retry defaults', () => {
 
 describe('synthesizeToolCallFromIntent — last-resort Codex inventory call', () => {
   it('creates a safe shell inventory command when retry still only narrates', () => {
-    const tc = synthesizeToolCallFromIntent('shell_exec', [APPLY_PATCH, SHELL], {
+    const tc = synthesizeToolCallFromIntent('exec', [APPLY_PATCH, EXEC], {
       lastUserText: 'understand my codebase very detail',
       sourceText: "I’ll inspect the repository structure and key project files first.",
     });
-    assert.equal(tc.name, 'shell_exec');
+    assert.equal(tc.name, 'exec');
     assert.deepEqual(JSON.parse(tc.argumentsJson), {
-      command: 'pwd; ls',
+      input: 'pwd; ls',
     });
   });
 
