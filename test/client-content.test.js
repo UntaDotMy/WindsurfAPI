@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { compactSystemPromptForCascade, contentToString } from '../src/client.js';
+import { compactSystemPromptForCascade, contentToString, modifiedTextTopUpDelta } from '../src/client.js';
 
 describe('Cascade text conversion safety', () => {
   it('does not serialize image base64 into replayed text history', () => {
@@ -29,5 +29,22 @@ describe('Cascade text conversion safety', () => {
     assert.ok(!/x-anthropic-billing-header/i.test(compact));
     assert.ok(!/Claude Code/i.test(compact));
     assert.ok(compact.includes('Working directory: /Users/blithe/Downloads/Code/Test'));
+  });
+
+  it('does not top up duplicate modified response text from the final sweep', () => {
+    const responseText = 'Hi! I am ready to help with the coding task.';
+    const modifiedText = responseText + responseText;
+
+    assert.equal(modifiedTextTopUpDelta(responseText, modifiedText, responseText.length), '');
+  });
+
+  it('still tops up real modified response extensions from the final sweep', () => {
+    const responseText = 'The fix is ready.';
+    const modifiedText = `${responseText} I also added coverage.`;
+
+    assert.equal(
+      modifiedTextTopUpDelta(responseText, modifiedText, responseText.length),
+      ' I also added coverage.'
+    );
   });
 });
