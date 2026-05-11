@@ -1017,6 +1017,16 @@ function cachedUsage(messages, completionText) {
   };
 }
 
+export function isNluRetryEnabled(provider, modelKey, route = 'chat') {
+  if (process.env.WINDSURFAPI_NLU_RETRY === '0') return false;
+  if (process.env.WINDSURFAPI_NLU_RETRY === '1') return true;
+  if (route === 'responses') return true;
+  if (/openai|codex/i.test(String(provider || ''))) return true;
+  if (/\b(?:gpt|o\d|codex)/i.test(String(modelKey || ''))) return true;
+  return /zhipu|glm|moonshot|kimi/i.test(String(provider || ''))
+    || /^(?:glm|kimi)/i.test(String(modelKey || ''));
+}
+
 export function applyToolPreambleBudget(tools, toolChoice, callerEnv = '', opts = {}) {
   const modelKey = opts.modelKey || null;
   const provider = opts.provider || null;
@@ -2251,7 +2261,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
           if (/```\s*(?:json|tool_call)/i.test(narrativeSource)) markers.push('fenced_json');
           if (/"function"\s*:|"tool_calls"\s*:|"function_call"\s*:/.test(narrativeSource)) markers.push('openai_native');
           if (/\{\s*"name"\s*:\s*"[a-zA-Z0-9_-]+"\s*,\s*"arguments"/.test(narrativeSource)) markers.push('bare_json');
-          if (/^\s*(?:I'?ll|I will|Let me|I'?m going to)\s+(?:call|use|invoke|run)/im.test(narrativeSource)) markers.push('natural_lang');
+          if (/^\s*(?:I['’]?ll|I will|Let me|I['’]?m going to)\s+(?:call|use|invoke|run|list|read|search|inspect|explore|analyz)/im.test(narrativeSource)) markers.push('natural_lang');
           log.info(`Chat[non-stream]: emulateTools=true but parser found 0 tool_calls (model=${modelKey} provider=${provider}); markers=${markers.join(',') || 'none'}; head="${rawTextHead}"`);
           // v2.0.72 (#115 #120) — NLU intent recovery. GPT/GLM/Kimi
           // narrate "I'll call X with Y" instead of emitting the
@@ -2294,14 +2304,11 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
           // args case (#125 DuZunTianXia) goes from 0 tool_calls to
           // a real protocol emit on the second pass.
           //
-          // Default ON for GLM/Kimi (notoriously narrate instead of calling
-          // tools on first pass). Claude/GPT have good first-pass compliance
-          // so they only get retry when explicitly opted in. Set
-          // WINDSURFAPI_NLU_RETRY=0 to disable globally.
-          const nluRetryEnabled = process.env.WINDSURFAPI_NLU_RETRY !== '0'
-            && (process.env.WINDSURFAPI_NLU_RETRY === '1'
-                || /zhipu|glm|moonshot|kimi/i.test(String(provider || ''))
-                || /^(?:glm|kimi)/i.test(String(modelKey || '')));
+          // Default ON for GLM/Kimi and Codex/Responses. GPT-backed Codex
+          // turns frequently narrate "I'll inspect..." without emitting
+          // function_call JSON, which otherwise ends the agent loop.
+          // Set WINDSURFAPI_NLU_RETRY=0 to disable globally.
+          const nluRetryEnabled = isNluRetryEnabled(provider, modelKey, route);
           if (toolCalls.length === 0
               && nluRetryEnabled
               && Array.isArray(tools) && tools.length > 0
@@ -3117,7 +3124,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 if (/```\s*(?:json|tool_call)/i.test(accNarrative)) markers.push('fenced_json');
                 if (/"function"\s*:|"tool_calls"\s*:|"function_call"\s*:/.test(accNarrative)) markers.push('openai_native');
                 if (/\{\s*"name"\s*:\s*"[a-zA-Z0-9_-]+"\s*,\s*"arguments"/.test(accNarrative)) markers.push('bare_json');
-                if (/^\s*(?:I'?ll|I will|Let me|I'?m going to)\s+(?:call|use|invoke|run)/im.test(accNarrative)) markers.push('natural_lang');
+                if (/^\s*(?:I['’]?ll|I will|Let me|I['’]?m going to)\s+(?:call|use|invoke|run|list|read|search|inspect|explore|analyz)/im.test(accNarrative)) markers.push('natural_lang');
                 log.info(`Chat[stream]: emulateTools=true but parser found 0 tool_calls (model=${modelKey} provider=${provider}); markers=${markers.join(',') || 'none'}; head="${head}"`);
                 // v2.0.72 (#115 #120) — NLU intent recovery on stream
                 // tail. If model narrate-d a tool intent without
@@ -3145,6 +3152,62 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                     }
                     if (filtered.length) {
                       log.info(`Chat[stream]: NLU recovery — promoted ${filtered.length} narrative tool_call(s) mid-stream (markers=${markers.join(',') || 'none'})`);
+                    }
+                  }
+                  if (collectedToolCalls.length === 0 && isNluRetryEnabled(provider, modelKey, deps.route || 'chat')) {
+                    const intendedTool = detectToolIntentInNarrative(accNarrative, declaredTools, { lastUserText: lastUser });
+                    if (intendedTool) {
+                      try {
+                        const correctionMessages = [
+                          ...cascadeMessages,
+                          { role: 'assistant', content: accNarrative.slice(0, 4000) },
+                          { role: 'user', content:
+                            `Your previous response described intending to call \`${intendedTool}\` but didn't emit the tool-call protocol block. ` +
+                            `Re-emit the call now using the EXACT protocol format defined at the top of this conversation. ` +
+                            `Do NOT narrate. Do NOT describe. Just the protocol block. ` +
+                            `Provide a concrete argument value (the literal command / file path / query) — never placeholders like "command" or "the file".` },
+                        ];
+                        log.info(`Chat[stream]: NLU retry — first pass narrate-only, retrying with correction (tool=${intendedTool} markers=${markers.join(',') || 'none'})`);
+                        const retryChunks = await client.cascadeChat(correctionMessages, modelEnum, modelUid, {
+                          reuseEntry: null,
+                          toolPreamble: nativeBridgeOn ? '' : toolPreamble,
+                          displayModel: model,
+                          nativeMode: nativeBridgeOn,
+                          nativeAllowlist: nativeOpts?.allowlist || null,
+                          additionalSteps: nativeOpts?.additionalSteps || null,
+                        });
+                        let retryText = '';
+                        let retryThinking = '';
+                        for (const c of retryChunks) {
+                          if (c.text) retryText += c.text;
+                          if (c.thinking) retryThinking += c.thinking;
+                        }
+                        const retryParsed = parseToolCallsFromText(retryText, { modelKey, provider, route: deps.route || 'chat' });
+                        let retryCalls = filterToolCallsByAllowlist(retryParsed.toolCalls || [], declaredTools);
+                        if (!retryCalls.length) {
+                          const retrySource = retryText.trim() ? retryText : retryThinking;
+                          const recovered2 = extractIntentFromNarrative(retrySource, declaredTools, { lastUserText: lastUser });
+                          if (recovered2.length) {
+                            retryCalls = filterToolCallsByAllowlist(
+                              recovered2.map((r, i) => ({ id: `nlu_retry_${i}_${Date.now().toString(36)}`, name: r.name, argumentsJson: r.argumentsJson })),
+                              declaredTools,
+                            );
+                          }
+                        }
+                        for (const rawTc of retryCalls) {
+                          const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
+                          const idx = collectedToolCalls.length;
+                          collectedToolCalls.push(tc);
+                          emitToolCallDelta(tc, idx);
+                        }
+                        if (retryCalls.length) {
+                          log.info(`Chat[stream]: NLU retry — promoted ${retryCalls.length} tool_call(s) on second pass (tool=${intendedTool})`);
+                        } else {
+                          log.warn(`Chat[stream]: NLU retry — second pass also produced 0 tool_calls; giving up (model=${modelKey})`);
+                        }
+                      } catch (retryErr) {
+                        log.warn(`Chat[stream]: NLU retry failed: ${retryErr.message}`);
+                      }
                     }
                   }
                 }
