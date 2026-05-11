@@ -288,11 +288,32 @@ function userPromptLooksActionable(lastUserText) {
   // v2.0.81 (#125): widen to Chinese verbs/nouns so GLM-5.1 / Kimi
   // running with a Chinese system prompt + Chinese user turn still
   // routes through Layer 3.
-  if (/\b(?:run|exec|execute|cat|ls|echo|grep|find|read|search|list|invoke|call|fetch|get|fix|edit|write|patch)\b/i.test(lastUserText)) return true;
-  if (/\b(?:shell|bash|terminal|command|tool|function|file|path)\b/i.test(lastUserText)) return true;
+  if (/\b(?:run|exec|execute|cat|ls|echo|grep|find|read|search|list|invoke|call|fetch|get|fix|edit|write|patch|inspect|examine|analyz|explore|understand|review)\b/i.test(lastUserText)) return true;
+  if (/\b(?:shell|bash|terminal|command|tool|function|file|path|repo|repository|codebase|project|workspace)\b/i.test(lastUserText)) return true;
   if (/(?:运行|执行|读取|查看|列出|查找|搜索|获取|修改|编辑|写入|修复|分析|调用|使用|拉取|下载|找到|看一下|看看|检查)/.test(lastUserText)) return true;
   if (/(?:文件|目录|路径|命令|工具|函数|参数|项目|代码|配置)/.test(lastUserText)) return true;
   return false;
+}
+
+function pickFallbackToolName(text, lastUserText, names, primaryParam) {
+  const ordered = [...names];
+  const combined = `${text || ''}\n${lastUserText || ''}`;
+  const findBy = (re) => ordered.find(name =>
+    re.test(name) || re.test(primaryParam.get(name) || '')
+  );
+  if (/\b(?:shell|bash|terminal|command|repo|repository|codebase|workspace|project|list|ls|grep|find|inspect|explore)\b/i.test(combined)) {
+    const shellLike = findBy(/(?:shell|bash|exec|command|terminal|run)/i);
+    if (shellLike) return shellLike;
+  }
+  if (/\b(?:read|view|open|cat|file|path)\b/i.test(combined)) {
+    const readLike = findBy(/(?:read|view|open|file|path)/i);
+    if (readLike) return readLike;
+  }
+  if (/\b(?:search|grep|find|query|lookup)\b/i.test(combined)) {
+    const searchLike = findBy(/(?:search|grep|find|query|lookup)/i);
+    if (searchLike) return searchLike;
+  }
+  return ordered[0];
 }
 
 /**
@@ -317,10 +338,10 @@ export function detectToolIntentInNarrative(text, tools, opts = {}) {
   if (!Array.isArray(tools) || !tools.length) return null;
   const lastUserText = opts.lastUserText || '';
   if (!userPromptLooksActionable(lastUserText)) return null;
-  const { names } = indexTools(tools);
+  const { names, primaryParam } = indexTools(tools);
   if (!names.size) return null;
   // Verb forms (English + Chinese) that signal "I'm about to call X".
-  const verbPattern = /\b(?:call|invoke|run|use|execute|exec|trigger|fire|going to|will|let me|i'?ll|i'?m going|need to|should)\b|(?:调用|使用|运行|执行|触发|启动|让我|我会|我将|准备|打算|想要|需要|应该)/i;
+  const verbPattern = /\b(?:call|invoke|run|use|execute|exec|trigger|fire|going to|will|let me|i['’]?ll|i['’]?m going|need to|should)\b|(?:调用|使用|运行|执行|触发|启动|让我|我会|我将|准备|打算|想要|需要|应该)/i;
   if (!verbPattern.test(text)) return null;
   // Action keywords (file ops, search, read, etc.) — these stand in
   // for "the model is talking about USING tools generically".
@@ -334,7 +355,7 @@ export function detectToolIntentInNarrative(text, tools, opts = {}) {
   // didn't name the tool). Return the first declared tool — caller's
   // correction prompt will name it explicitly so the retry knows
   // which tool to emit.
-  if (actionVerbPattern.test(text)) return [...names][0];
+  if (actionVerbPattern.test(text)) return pickFallbackToolName(text, lastUserText, names, primaryParam);
   return null;
 }
 

@@ -13,6 +13,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { isNluRetryEnabled } from '../src/handlers/chat.js';
 import { extractIntentFromNarrative, detectToolIntentInNarrative } from '../src/handlers/intent-extractor.js';
 import { buildToolPreambleForProto } from '../src/handlers/tool-emulation.js';
 
@@ -31,6 +32,7 @@ const fnTool = (name, props = { command: 'string' }, required = ['command']) => 
 const SHELL = fnTool('shell_exec');
 const BASH = fnTool('Bash');
 const READ = fnTool('Read', { file_path: 'string' }, ['file_path']);
+const APPLY_PATCH = fnTool('apply_patch', { patch: 'string' }, ['patch']);
 
 describe('Chinese verb recognition (Layer 3)', () => {
   it('catches "让我用 Bash 命令 \'ls\'" with concrete value', () => {
@@ -178,6 +180,22 @@ describe('detectToolIntentInNarrative — gates the v2.0.82 retry loop', () => {
     assert.equal(r, 'Bash');
   });
 
+  it('detects Codex-style curly-apostrophe narration for codebase inspection', () => {
+    const r = detectToolIntentInNarrative(
+      "I’ll inspect the repository structure and key project files first, using the provided command wrapper style where possible.",
+      [SHELL], { lastUserText: 'please understand this codebase' },
+    );
+    assert.equal(r, 'shell_exec');
+  });
+
+  it('prefers a shell-like tool for Codex codebase inspection even when it is not first', () => {
+    const r = detectToolIntentInNarrative(
+      "I’ll inspect the repository structure and key project files first, using the provided command wrapper style where possible.",
+      [APPLY_PATCH, SHELL], { lastUserText: 'please understand this codebase' },
+    );
+    assert.equal(r, 'shell_exec');
+  });
+
   it('returns null when user prompt is not actionable', () => {
     const r = detectToolIntentInNarrative(
       "I should call shell_exec.",
@@ -192,6 +210,33 @@ describe('detectToolIntentInNarrative — gates the v2.0.82 retry loop', () => {
       [SHELL], { lastUserText: 'tell me about shell_exec' },
     );
     assert.equal(r, null);
+  });
+});
+
+describe('isNluRetryEnabled — Codex/GPT narrate retry defaults', () => {
+  it('enables retry by default for Responses route and OpenAI/GPT models', () => {
+    const previous = process.env.WINDSURFAPI_NLU_RETRY;
+    try {
+      delete process.env.WINDSURFAPI_NLU_RETRY;
+      assert.equal(isNluRetryEnabled('anthropic', 'claude-sonnet-4-6', 'responses'), true);
+      assert.equal(isNluRetryEnabled('openai', 'gpt-5.5-high', 'chat'), true);
+      assert.equal(isNluRetryEnabled(null, 'gpt-5.5-high', 'chat'), true);
+      assert.equal(isNluRetryEnabled('anthropic', 'claude-sonnet-4-6', 'chat'), false);
+    } finally {
+      if (previous == null) delete process.env.WINDSURFAPI_NLU_RETRY;
+      else process.env.WINDSURFAPI_NLU_RETRY = previous;
+    }
+  });
+
+  it('honours the global retry disable override', () => {
+    const previous = process.env.WINDSURFAPI_NLU_RETRY;
+    try {
+      process.env.WINDSURFAPI_NLU_RETRY = '0';
+      assert.equal(isNluRetryEnabled('openai', 'gpt-5.5-high', 'responses'), false);
+    } finally {
+      if (previous == null) delete process.env.WINDSURFAPI_NLU_RETRY;
+      else process.env.WINDSURFAPI_NLU_RETRY = previous;
+    }
   });
 });
 
