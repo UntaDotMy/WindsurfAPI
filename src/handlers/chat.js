@@ -1250,7 +1250,9 @@ export async function handleChatCompletions(body, context = {}) {
   // original-model request will look up, instead of the fallback-model
   // slot that the next request will miss.
   const originalCkey = cacheKey(body, context.callerKey || body.__callerKey || '');
-  const result = await _handleChatCompletionsInner(body, { ...context, __originalCkey: originalCkey });
+  const innerContext = { ...context, __originalCkey: originalCkey };
+  const result = await _handleChatCompletionsInner(body, innerContext);
+  if (result && typeof result === 'object' && !result.context) result.context = innerContext;
   if (shouldAutoFallback(body, context, result)) {
     // v2.0.88 (audit H-1) — `body.model` is the RAW request string; the
     // inner handler resolves it through mergeReasoningEffortIntoModel +
@@ -1266,14 +1268,16 @@ export async function handleChatCompletions(body, context = {}) {
     const originalModel = body.model;
     const fallbackModel = result.body.error.fallback_model;
     log.info(`auto-fallback: ${originalModel} → ${fallbackModel} (alias-key=${originalRoutingKey} whole pool rate_limited)`);
+    const fallbackContext = { ...context, __fallbackAttempt: true, __aliasModelKey: originalRoutingKey, __originalCkey: originalCkey };
     const fallbackResult = await _handleChatCompletionsInner(
       { ...body, model: fallbackModel },
       // __aliasModelKey carries the resolved/merged ORIGINAL routing
       // key so cascade pool dual-index hits the slot the next turn
       // will actually look up. __originalCkey threads through so
       // cacheSet writes also go to the original-model cache slot.
-      { ...context, __fallbackAttempt: true, __aliasModelKey: originalRoutingKey, __originalCkey: originalCkey },
+      fallbackContext,
     );
+    if (fallbackResult && typeof fallbackResult === 'object' && !fallbackResult.context) fallbackResult.context = fallbackContext;
     // Restore original model id in the response body so client code
     // matching on `response.model === requested model` still works.
     if (fallbackResult?.body) {
@@ -1831,7 +1835,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
   let reuseEntryDead = false;
   if (reuseEntry) log.info(`Chat[${reqId}]: reuse HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} model=${displayModel}`);
   const sticky = stickyFromContext(body, context, callerKey);
-  const stickyAccountId = sticky && !reuseEntry ? getStickyAccountId(sticky) : null;
+  const preferredAccountId = context.preferredAccountId || '';
+  const requirePreferredAccount = !!(context.requirePreferredAccount && preferredAccountId);
+  const stickyAccountId = preferredAccountId || (sticky && !reuseEntry ? getStickyAccountId(sticky) : null);
   if (sticky) {
     log.info(`Chat[${reqId}]: sticky ${sticky.kind} key=${sticky.keyHash} ${stickyAccountId ? `HIT account=${stickyAccountId}` : 'MISS'}`);
   }
@@ -1889,7 +1895,20 @@ async function _handleChatCompletionsInner(body, context = {}) {
     if (!acct) {
       if (stickyAccountId && attempt === 0) {
         acct = acquireAccountById(stickyAccountId, routingModelKey);
-        if (!acct) log.info(`Chat[${reqId}]: sticky ${sticky.kind} owner unavailable account=${stickyAccountId}; falling back`);
+        if (!acct) {
+          if (requirePreferredAccount) {
+            return {
+              status: 409,
+              body: {
+                error: {
+                  message: 'Previous response owner account is unavailable; retry later.',
+                  type: 'previous_response_unavailable',
+                },
+              },
+            };
+          }
+          log.info(`Chat[${reqId}]: sticky ${sticky?.kind || 'preferred'} owner unavailable account=${stickyAccountId}; falling back`);
+        }
       }
     }
     if (!acct) {
@@ -2451,6 +2470,8 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       }, poolCtx.callerKey || '', ttlHint === undefined ? 0 : ttlHint);
     }
 
+    if (acct?.id) context.__selectedAccountId = acct.id;
+    if (apiKey) context.__selectedApiKey = apiKey;
     bindStickyAfterSuccess(sticky, acct, stickyAccountId, reqId);
     reportSuccess(apiKey);
     updateCapability(apiKey, modelKey, true, 'success');
@@ -2750,7 +2771,9 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       let reuseEntryDead = false;
       if (reuseEntry) log.info(`Chat: cascade reuse HIT cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
       const sticky = stickyFromContext({ model, messages }, deps.context || {}, callerKey);
-      const stickyAccountId = sticky && !reuseEntry ? getStickyAccountId(sticky) : null;
+      const preferredAccountId = deps.context?.preferredAccountId || '';
+      const requirePreferredAccount = !!(deps.context?.requirePreferredAccount && preferredAccountId);
+      const stickyAccountId = preferredAccountId || (sticky && !reuseEntry ? getStickyAccountId(sticky) : null);
       if (sticky) {
         log.info(`Chat[${reqId}]: sticky ${sticky.kind} key=${sticky.keyHash} ${stickyAccountId ? `HIT account=${stickyAccountId}` : 'MISS'} stream`);
       }
@@ -2951,7 +2974,16 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
           if (!acct) {
             if (stickyAccountId && attempt === 0) {
               acct = acquireAccountById(stickyAccountId, modelKey);
-              if (!acct) log.info(`Chat[${reqId}]: sticky ${sticky.kind} owner unavailable account=${stickyAccountId}; falling back stream`);
+              if (!acct) {
+                if (requirePreferredAccount) {
+                  send({ id, object: 'chat.completion.chunk', created, model,
+                    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                    error: { message: 'Previous response owner account is unavailable; retry later.', type: 'previous_response_unavailable' } });
+                  if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
+                  return;
+                }
+                log.info(`Chat[${reqId}]: sticky ${sticky?.kind || 'preferred'} owner unavailable account=${stickyAccountId}; falling back stream`);
+              }
             }
           }
           if (!acct) {
@@ -3195,6 +3227,8 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               }, callerKey, ttlHint === undefined ? 0 : ttlHint);
             }
             // success
+            if (acct?.id && deps.context) deps.context.__selectedAccountId = acct.id;
+            if (currentApiKey && deps.context) deps.context.__selectedApiKey = currentApiKey;
             bindStickyAfterSuccess(sticky, acct, stickyAccountId, reqId);
             if (hadSuccess) reportSuccess(currentApiKey);
             updateCapability(currentApiKey, modelKey, true, 'success');

@@ -847,6 +847,7 @@ export async function handleResponses(body, deps = {}) {
   } catch (err) {
     return {
       status: 400,
+      context,
       body: {
         error: {
           message: err?.message || 'Invalid Responses request',
@@ -860,16 +861,19 @@ export async function handleResponses(body, deps = {}) {
 
   if (!body.stream) {
     const result = await chatHandler({ ...chatBody, stream: false, __route: 'responses' }, context);
-    if (result.status !== 200) return result;
-    return { status: 200, body: chatToResponse(result.body, requestedModel, responseId, genMessageId(), requestedTools) };
+    const resultContext = result.context || context;
+    if (result.status !== 200) return { ...result, context: resultContext };
+    return { status: 200, context: resultContext, body: chatToResponse(result.body, requestedModel, responseId, genMessageId(), requestedTools) };
   }
 
   const streamResult = await chatHandler({ ...chatBody, stream: true, __route: 'responses' }, context);
-  if (!streamResult.stream) return streamResult;
+  const streamContext = streamResult.context || context;
+  if (!streamResult.stream) return { ...streamResult, context: streamContext };
 
   return {
     status: 200,
     stream: true,
+    context: streamContext,
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-store',
