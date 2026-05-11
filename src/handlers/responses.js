@@ -8,6 +8,7 @@
 import { randomUUID } from 'crypto';
 import { handleChatCompletions } from './chat.js';
 import { log } from '../config.js';
+import { buildStickyContext } from '../sticky-sessions.js';
 
 function genResponseId() {
   return 'resp_' + randomUUID().replace(/-/g, '').slice(0, 24);
@@ -834,7 +835,10 @@ function createCaptureRes(translator, realRes) {
 
 export async function handleResponses(body, deps = {}) {
   const chatHandler = deps.handleChatCompletions || handleChatCompletions;
-  const context = deps.context || {};
+  const context = { ...(deps.context || {}) };
+  if (!context.sticky) {
+    context.sticky = buildStickyContext(body, context.headers || {}, context.callerKey || body.__callerKey || '');
+  }
   const responseId = genResponseId();
   const requestedModel = body.model || 'claude-sonnet-4.6';
   let chatBody;

@@ -5,7 +5,7 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
-import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, getDroughtSummary } from '../auth.js';
+import { getApiKey, acquireAccountByKey, acquireAccountById, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, getDroughtSummary } from '../auth.js';
 import { resolveModel, getModelInfo, pickRateLimitFallback } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -31,6 +31,9 @@ import {
 } from '../cascade-native-bridge.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import { registerSseController } from '../sse-registry.js';
+import {
+  buildStickyContext, getStickyAccountId, bindStickyAccount, shouldPreserveStickyFallback,
+} from '../sticky-sessions.js';
 
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
@@ -81,6 +84,21 @@ async function internalErrorBackoff(retryIdx) {
   const ms = Math.min(500 * Math.pow(2, retryIdx), 5000);
   await new Promise(r => setTimeout(r, ms));
   return ms;
+}
+
+function stickyFromContext(body, context, callerKey) {
+  return context.sticky || buildStickyContext(body, context.headers || {}, callerKey);
+}
+
+function bindStickyAfterSuccess(sticky, selectedAccount, existingAccountId, reqId) {
+  if (!sticky || !selectedAccount?.id) return;
+  const preserveExisting = shouldPreserveStickyFallback(sticky, existingAccountId, selectedAccount.id);
+  const stored = bindStickyAccount(sticky, selectedAccount.id, { preserveExisting });
+  if (stored) {
+    log.info(`Chat[${reqId}]: sticky ${sticky.kind} bound key=${sticky.keyHash} account=${selectedAccount.id}`);
+  } else if (preserveExisting) {
+    log.info(`Chat[${reqId}]: sticky ${sticky.kind} preserved original account=${existingAccountId} during fallback`);
+  }
 }
 
 function upstreamTransientErrorMessage(model, triedCount, reason = 'internal_error') {
@@ -1812,6 +1830,11 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // instead of putting a known-dead cascadeId back in the pool.
   let reuseEntryDead = false;
   if (reuseEntry) log.info(`Chat[${reqId}]: reuse HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} model=${displayModel}`);
+  const sticky = stickyFromContext(body, context, callerKey);
+  const stickyAccountId = sticky && !reuseEntry ? getStickyAccountId(sticky) : null;
+  if (sticky) {
+    log.info(`Chat[${reqId}]: sticky ${sticky.kind} key=${sticky.keyHash} ${stickyAccountId ? `HIT account=${stickyAccountId}` : 'MISS'}`);
+  }
 
   // Non-stream: retry with a different account on model-not-available errors
   const tried = [];
@@ -1861,6 +1884,12 @@ async function _handleChatCompletionsInner(body, context = {}) {
           }
           reuseEntry = null;
         }
+      }
+    }
+    if (!acct) {
+      if (stickyAccountId && attempt === 0) {
+        acct = acquireAccountById(stickyAccountId, routingModelKey);
+        if (!acct) log.info(`Chat[${reqId}]: sticky ${sticky.kind} owner unavailable account=${stickyAccountId}; falling back`);
       }
     }
     if (!acct) {
@@ -2422,6 +2451,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       }, poolCtx.callerKey || '', ttlHint === undefined ? 0 : ttlHint);
     }
 
+    bindStickyAfterSuccess(sticky, acct, stickyAccountId, reqId);
     reportSuccess(apiKey);
     updateCapability(apiKey, modelKey, true, 'success');
     recordRequest(model, true, Date.now() - startTime, apiKey);
@@ -2719,6 +2749,11 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       // v2.0.25 HIGH-2: same dead-entry signal as the non-stream path.
       let reuseEntryDead = false;
       if (reuseEntry) log.info(`Chat: cascade reuse HIT cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
+      const sticky = stickyFromContext({ model, messages }, deps.context || {}, callerKey);
+      const stickyAccountId = sticky && !reuseEntry ? getStickyAccountId(sticky) : null;
+      if (sticky) {
+        log.info(`Chat[${reqId}]: sticky ${sticky.kind} key=${sticky.keyHash} ${stickyAccountId ? `HIT account=${stickyAccountId}` : 'MISS'} stream`);
+      }
 
       // Strip <tool_call>/<tool_result> blocks in Cascade mode.
       // In emulation mode, parsed calls are emitted as OpenAI tool_calls.
@@ -2911,6 +2946,12 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 }
                 reuseEntry = null;
               }
+            }
+          }
+          if (!acct) {
+            if (stickyAccountId && attempt === 0) {
+              acct = acquireAccountById(stickyAccountId, modelKey);
+              if (!acct) log.info(`Chat[${reqId}]: sticky ${sticky.kind} owner unavailable account=${stickyAccountId}; falling back stream`);
             }
           }
           if (!acct) {
@@ -3154,6 +3195,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               }, callerKey, ttlHint === undefined ? 0 : ttlHint);
             }
             // success
+            bindStickyAfterSuccess(sticky, acct, stickyAccountId, reqId);
             if (hadSuccess) reportSuccess(currentApiKey);
             updateCapability(currentApiKey, modelKey, true, 'success');
             recordRequest(model, true, Date.now() - startTime, currentApiKey);

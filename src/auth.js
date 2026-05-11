@@ -734,6 +734,16 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
 }
 
 /**
+ * Try to reserve a specific account by account id. Codex-style sticky
+ * sessions persist account ids rather than raw upstream API keys, so this
+ * mirrors acquireAccountByKey while keeping secrets out of the sticky store.
+ */
+export function acquireAccountById(id, modelKey = null) {
+  const a = accounts.find(x => x.id === id);
+  return a ? acquireAccountByKey(a.apiKey, modelKey) : null;
+}
+
+/**
  * Explain why a pinned account cannot be used right now. Used by strict
  * Cascade reuse mode, where switching accounts would lose server-side
  * conversation context.
